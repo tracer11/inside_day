@@ -31,6 +31,11 @@ WEIGHT_SPREAD = 0.2
 # Major ETFs explicitly included in the scan
 MAJOR_ETFS = ["SPY", "QQQ", "IWM", "DIA"]
 
+# ---- NEW: EMA slope hard-gate tolerance (normalized by ATR10) ----
+# This prevents CALLs when EMA is drifting down (and PUTs when drifting up),
+# while allowing tiny slope noise to pass.
+SLOPE_TOL = 0.02
+
 UA = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -381,8 +386,7 @@ def scan_inside_days():
         else:
             ema21_slope_raw = float(ema21_series.iloc[last_idx] - ema21_series.iloc[0])
 
-        # --- Weak link fix: normalize slope by ATR ---
-        ema21_slope_norm = 0.0
+        # --- normalize slope by ATR ---
         try:
             ema21_slope_norm = float(ema21_slope_raw) / float(atr10_val)
         except Exception:
@@ -410,12 +414,15 @@ def scan_inside_days():
                 "market_ok": market_ok,
                 "ema21_slope": round(float(ema21_slope_raw), 6),
                 "ema21_slope_norm": round(float(ema21_slope_norm), 4),
+                # NEW: keep raw norm to avoid gating on rounding artifacts
+                "ema21_slope_norm_raw": float(ema21_slope_norm),
             }
         )
 
     print(f"Found {len(all_inside_days)} inside-day candidates.")
 
-    # ---- SCORE + DIRECTION ----
+    # ---- SCORE + DIRECTION (with EMA slope hard gate) ----
+    filtered = []
     for sig in all_inside_days:
         base = WEIGHT_COMPRESSION * sig["compression_score"]
         if sig["above_ema"]:
@@ -425,12 +432,23 @@ def scan_inside_days():
 
         # Direction = stock only (SPY is NOT used here)
         stock_bias = 1.0 if sig["above_ema"] else -1.0
-        slope_bias = _clamp(sig["ema21_slope_norm"], -1.0, 1.0)
+        slope = float(sig.get("ema21_slope_norm_raw", sig["ema21_slope_norm"]))
+        slope_bias = _clamp(slope, -1.0, 1.0)
 
         combined = 0.6 * stock_bias + 0.4 * slope_bias
-        sig["direction"] = "CALL" if combined >= 0 else "PUT"
-        sig["score"] = round(float(base), 4)
+        direction = "CALL" if combined >= 0 else "PUT"
 
+        # --- HARD GATE: slope must not contradict direction (with tolerance) ---
+        if direction == "CALL" and slope < -SLOPE_TOL:
+            continue
+        if direction == "PUT" and slope > SLOPE_TOL:
+            continue
+
+        sig["direction"] = direction
+        sig["score"] = round(float(base), 4)
+        filtered.append(sig)
+
+    all_inside_days = filtered
     by_ticker = {sig["ticker"]: sig for sig in all_inside_days}
 
     # ---- CHECK SPREADS AND BUILD TIER A ----
@@ -472,4 +490,3 @@ if __name__ == "__main__":
             )
     else:
         print("\nTIER A (score >= 0.55): none")
-
