@@ -1,52 +1,65 @@
 #!/usr/bin/env python3
+"""
+Inside-day (intraday) scanner optimized for:
+- run late day (2:45pm CT / 3:45pm ET)
+- buy late day
+- sell next morning
+
+Design:
+1) Signal = "today (so far) inside yesterday" with small ATR tolerance (prevents wick-noise zeroing).
+2) Compression is a rank metric, NOT a hard gate (you still see strict inside names even if range expanded).
+3) Dollar volume is "smart": excludes today's partial daily bar when market is open.
+4) Options spread check runs only on top-N ranked candidates.
+"""
+
 import time
 import random
 from io import StringIO
 from time import sleep
+from datetime import time as dtime
 
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from curl_cffi import requests as crequests  # required by your yfinance build
+from curl_cffi import requests as crequests
 
 # ---------------- CONFIG ----------------
-LOOKBACK_DAYS = 35
-RANGE_COMPRESSION_PCT = 0.70
-USE_TREND_FILTER = True
+LOOKBACK_DAYS = 45
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-US_MARKET_TZ = "US/Eastern"
+US_MARKET_TZ = "US/Eastern"  # keep everything in ET for market logic
 
-# options / liquidity filters
+# Intraday "still inside" tolerance:
+# allow today to poke outside yesterday by ATR10 * INSIDE_TOL_ATR
+INSIDE_TOL_ATR = 0.05   # 0.03 tight, 0.05 balanced, 0.08 looser
+
+# Optional: ignore first X minutes of the day when computing today's hi/lo (to reduce opening wick noise)
+IGNORE_OPEN_MINUTES = 0  # set 30 if you want to ignore 9:30-10:00 ET for today's hi/lo
+
+# Liquidity filters
+MIN_DOLLAR_VOL = 10_000_000      # lower than 25M because options spread filter is the real liquidity gate
+DOLLAR_VOL_LOOKBACK = 20         # completed bars
+
+# Options / spread filters
 CHECK_OPTIONS_FOR_MAX = 150
 MAX_ABS_SPREAD = 0.15
 MAX_REL_SPREAD = 0.015
 ATM_MONEYNES_PCT = 0.02
 
-# scoring weights (keep simple)
-WEIGHT_COMPRESSION = 0.5
-WEIGHT_TREND = 0.3
-WEIGHT_SPREAD = 0.2
+# Ranking weights
+WEIGHT_INSIDE_TIGHTNESS = 0.55   # how tightly today stays inside yesterday (normalized by ATR)
+WEIGHT_TREND = 0.25              # trend support (EMA21 + slope)
+WEIGHT_SPY_REGIME = 0.10         # small regime nudge, not dictator
+WEIGHT_SPREAD_BONUS = 0.20       # bonus if tight options spread found
 
-# Major ETFs explicitly included in the scan
+# Trend / direction
+USE_TREND_FILTER = True
+SLOPE_TOL = 0.02
+STRONG_SLOPE = 0.12
+SPY_DIR_WEIGHT = 0.25
+
+# Major ETFs included
 MAJOR_ETFS = ["SPY", "QQQ", "IWM", "DIA"]
-
-# ---- WIN-RATE OPTIMIZERS ----
-# 1) Hard gate: don't take CALLs when EMA drift is meaningfully negative (and vice versa)
-SLOPE_TOL = 0.02          # ATR-normalized tolerance (noise band)
-
-# 2) SPY as tiebreaker only (not dictator)
-STRONG_SLOPE = 0.12       # if |slope_norm| >= this, ignore SPY for direction
-SPY_DIR_WEIGHT = 0.25     # if slope is weak, SPY nudges direction by this amount
-
-# 3) Correlation control (prevents stacked red days)
-ENABLE_SECTOR_CAP = True
-MAX_PER_SECTOR = 1        # 1 = max win-rate / least correlation; 2 if you want more trades
-SECTOR_LOOKUP_MAX = 60    # only lookup sectors for top-N candidates (keeps runtime sane)
-
-# 4) Optional: avoid dead names (helps follow-through)
-MIN_DOLLAR_VOL = 25_000_000  # avg(Volume)*Close over last ~20 bars
-DOLLAR_VOL_LOOKBACK = 20
 
 UA = {
     "User-Agent": (
@@ -56,7 +69,7 @@ UA = {
     )
 }
 
-# -------------- UTILS --------------
+# ---------------- UTILS ----------------
 def _to_float(x):
     if hasattr(x, "iloc"):
         return float(x.iloc[0])
@@ -68,17 +81,16 @@ def _normalize_ticker(t: str) -> str:
 def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, float(x)))
 
-def _safe_mean(series: pd.Series) -> float:
-    try:
-        v = float(series.dropna().mean())
-        return v
-    except Exception:
-        return float("nan")
+def _market_close_time_et() -> dtime:
+    # 4:00pm ET regular close (ignore half-days for simplicity)
+    return dtime(16, 0)
 
-# -------------- S&P 500 LIST (robust) --------------
+def _market_open_time_et() -> dtime:
+    return dtime(9, 30)
+
+# ---------------- S&P 500 LIST ----------------
 def get_sp500_tickers(max_retries: int = 3) -> list[str]:
     DATAHUB_CSV = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
-    last_err = None
 
     for attempt in range(1, max_retries + 1):
         try:
@@ -89,30 +101,23 @@ def get_sp500_tickers(max_retries: int = 3) -> list[str]:
             candidates = []
             for df in tables:
                 cols = {str(c).lower().strip() for c in df.columns}
-                if ("symbol" in cols or "ticker symbol" in cols) and (
-                    "security" in cols or "company" in cols
-                ):
+                if ("symbol" in cols or "ticker symbol" in cols) and ("security" in cols or "company" in cols):
                     candidates.append(df)
 
             if not candidates:
                 raise ValueError("No constituents-like table found on Wikipedia.")
 
             df = max(candidates, key=len)
-            sym_col = (
-                "Symbol"
-                if "Symbol" in df.columns
-                else ("Ticker symbol" if "Ticker symbol" in df.columns else None)
-            )
+            sym_col = "Symbol" if "Symbol" in df.columns else ("Ticker symbol" if "Ticker symbol" in df.columns else None)
             if not sym_col:
                 raise ValueError("Ticker column missing in chosen table.")
 
             tickers = df[sym_col].astype(str).map(_normalize_ticker).dropna().unique().tolist()
             if len(tickers) < 450:
-                raise ValueError(f"Too few tickers parsed from Wikipedia: {len(tickers)}")
+                raise ValueError(f"Too few tickers parsed: {len(tickers)}")
             return tickers
 
-        except Exception as e:
-            last_err = e
+        except Exception:
             if attempt < max_retries:
                 sleep(0.8)
 
@@ -127,30 +132,20 @@ def get_sp500_tickers(max_retries: int = 3) -> list[str]:
         raise ValueError(f"Too few tickers from fallback: {len(tickers)}")
     return tickers
 
-# -------------- TECHNICALS --------------
+# ---------------- TECHNICALS ----------------
 def atr(df: pd.DataFrame, period: int = 10) -> pd.Series:
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
     prev_close = close.shift(1)
-
-    parts = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1,
-    )
+    parts = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1)
     tr = parts.max(axis=1, skipna=True)
     return tr.rolling(period).mean()
 
 def ema(series: pd.Series, length: int = 21) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
-def is_inside_day(df: pd.DataFrame, idx: int) -> bool:
-    return (
-        df["High"].iloc[idx] <= df["High"].iloc[idx - 1]
-        and df["Low"].iloc[idx] >= df["Low"].iloc[idx - 1]
-    )
-
-# -------------- DAILY DOWNLOAD (batch + curl_cffi session) --------------
+# ---------------- DAILY DOWNLOAD ----------------
 def _split_chunks(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i+n]
@@ -169,7 +164,6 @@ def download_daily_spx(tickers):
 
     data = {}
     failed = []
-
     BATCH_SIZE = 50
     MAX_RETRIES = 4
     TIMEOUT_S = 30
@@ -191,7 +185,6 @@ def download_daily_spx(tickers):
                     threads=True,
                     group_by="ticker",
                 )
-
                 if df is None or df.empty:
                     raise RuntimeError("empty batch df")
 
@@ -225,18 +218,21 @@ def download_daily_spx(tickers):
                 time.sleep(sleep_s)
 
         failed.extend(remaining)
-
         done = min(batch_idx * BATCH_SIZE, len(tickers))
         print(f"...batch {batch_idx}: downloaded {len(data)} / {done}")
-        time.sleep(0.6 + random.random() * 0.6)
+        time.sleep(0.4 + random.random() * 0.5)
 
     if failed:
         print(f"\nFailed downloads ({len(set(failed))}): {sorted(set(failed))}")
 
     return data
 
-# -------------- INTRADAY OVERRIDE --------------
+# ---------------- INTRADAY OVERRIDE ----------------
 def override_today_with_intraday(ticker: str, df_daily: pd.DataFrame) -> pd.DataFrame:
+    """
+    If last daily bar is today, overwrite today's (daily) High/Low/Close with intraday extremes/last.
+    Optionally ignore first N minutes to avoid opening wick noise.
+    """
     if df_daily is None or df_daily.empty:
         return df_daily
 
@@ -245,7 +241,6 @@ def override_today_with_intraday(ticker: str, df_daily: pd.DataFrame) -> pd.Data
 
     last_ts = df_daily.index[-1]
     last_date = last_ts.date()
-
     if last_date != today_date:
         return df_daily
 
@@ -274,6 +269,15 @@ def override_today_with_intraday(ticker: str, df_daily: pd.DataFrame) -> pd.Data
     if intraday_today.empty:
         return df_daily
 
+    if IGNORE_OPEN_MINUTES and IGNORE_OPEN_MINUTES > 0:
+        start = pd.Timestamp.combine(
+            pd.Timestamp(today_date).tz_localize(US_MARKET_TZ).date(),
+            _market_open_time_et()
+        ).tz_localize(US_MARKET_TZ) + pd.Timedelta(minutes=IGNORE_OPEN_MINUTES)
+        intraday_today = intraday_today[intraday_today.index >= start]
+        if intraday_today.empty:
+            return df_daily
+
     hi = _to_float(intraday_today["High"].max())
     lo = _to_float(intraday_today["Low"].min())
     close = _to_float(intraday_today["Close"].iloc[-1])
@@ -281,10 +285,9 @@ def override_today_with_intraday(ticker: str, df_daily: pd.DataFrame) -> pd.Data
     df_daily.iloc[-1, df_daily.columns.get_loc("High")] = hi
     df_daily.iloc[-1, df_daily.columns.get_loc("Low")] = lo
     df_daily.iloc[-1, df_daily.columns.get_loc("Close")] = close
-
     return df_daily
 
-# -------------- OPTION SPREAD CHECK --------------
+# ---------------- OPTION SPREAD CHECK ----------------
 def best_option_spread_for_ticker(ticker: str, spot: float):
     try:
         tk = yf.Ticker(ticker)
@@ -312,7 +315,7 @@ def best_option_spread_for_ticker(ticker: str, spot: float):
                 continue
             if spot == 0:
                 continue
-            if abs(strike - spot) / spot > ATM_MONEYNES_PCT:
+            if abs(float(strike) - float(spot)) / float(spot) > ATM_MONEYNES_PCT:
                 continue
 
             spread = float(ask) - float(bid)
@@ -329,19 +332,18 @@ def best_option_spread_for_ticker(ticker: str, spot: float):
 
     scan_df(chain.calls if hasattr(chain, "calls") else None)
     scan_df(chain.puts if hasattr(chain, "puts") else None)
-
     return best_spread
 
-# -------------- MARKET CONTEXT (SPY) --------------
+# ---------------- MARKET CONTEXT (SPY) ----------------
 def get_spy_context():
-    spy = yf.download("SPY", period="90d", interval="1d", progress=False, auto_adjust=False, timeout=30)
+    spy = yf.download("SPY", period="120d", interval="1d", progress=False, auto_adjust=False, timeout=30)
     if spy is None or spy.empty:
         return None
     spy["EMA21"] = ema(spy["Close"], 21)
+
     close_val = _to_float(spy["Close"].iloc[-1])
     ema_val = _to_float(spy["EMA21"].iloc[-1])
 
-    # also compute slope to avoid "barely above EMA" regimes
     if len(spy) > 5:
         slope_raw = float(spy["EMA21"].iloc[-1] - spy["EMA21"].iloc[-6])
     else:
@@ -353,21 +355,41 @@ def get_spy_context():
         "ema21_slope_raw": slope_raw,
     }
 
-# -------------- OPTIONAL: SECTOR LOOKUP (for correlation control) --------------
-_sector_cache = {}
-def get_sector_fast(ticker: str) -> str:
-    if ticker in _sector_cache:
-        return _sector_cache[ticker]
-    try:
-        info = yf.Ticker(ticker).fast_info
-        # fast_info doesn't include sector; fall back to .info (slower)
-        sector = yf.Ticker(ticker).info.get("sector", "Unknown")
-    except Exception:
-        sector = "Unknown"
-    _sector_cache[ticker] = sector or "Unknown"
-    return _sector_cache[ticker]
+# ---------------- INSIDE (INTRADAY) ----------------
+def inside_with_tolerance(df: pd.DataFrame, idx: int, tol_atr: float) -> tuple[bool, float]:
+    """
+    Returns (is_inside-ish, inside_tightness_score)
+    - inside-ish: today within yesterday +/- tol
+    - tightness score: higher = more tightly inside (normalized by ATR)
+    """
+    prev_high = float(df["High"].iloc[idx - 1])
+    prev_low = float(df["Low"].iloc[idx - 1])
+    hi = float(df["High"].iloc[idx])
+    lo = float(df["Low"].iloc[idx])
 
-# -------------- MAIN SCAN --------------
+    atrv = df["ATR10"].iloc[idx]
+    if pd.isna(atrv) or float(atrv) <= 0:
+        return (False, 0.0)
+
+    tol = float(atrv) * float(tol_atr)
+
+    inside = (hi <= prev_high + tol) and (lo >= prev_low - tol)
+
+    # Tightness: how far the bar is from breaking, normalized by ATR
+    # margin_high = (prev_high - hi)  (positive if hi below prev_high)
+    # margin_low  = (lo - prev_low)   (positive if lo above prev_low)
+    margin_high = (prev_high - hi)
+    margin_low = (lo - prev_low)
+
+    # allow tolerance; margins can be slightly negative but still "inside-ish"
+    # Convert to a bounded [0..1]-ish score
+    tight = (margin_high + margin_low) / float(atrv)
+    tight = max(-1.0, min(1.0, tight))
+    tight_score = (tight + 1.0) / 2.0  # map [-1..1] -> [0..1]
+
+    return (inside, float(tight_score))
+
+# ---------------- MAIN SCAN ----------------
 def scan_inside_days():
     spy_ctx = get_spy_context()
 
@@ -380,14 +402,20 @@ def scan_inside_days():
     ohlc_map = download_daily_spx(spx)
     print(f"Downloaded OK for {len(ohlc_map)} tickers.")
 
-    all_inside_days = []
+    candidates = []
+
+    # diagnostics
+    inside_pass = 0
+    inside_fail = 0
+    killed_by_dv = 0
 
     for t, df in ohlc_map.items():
-        if len(df) < 22:
+        if df is None or df.empty or len(df) < 30:
             continue
 
         df = override_today_with_intraday(t, df)
 
+        # indicators
         df["ATR10"] = atr(df, 10)
         df["EMA21"] = ema(df["Close"], 21)
 
@@ -395,54 +423,70 @@ def scan_inside_days():
         if last_idx < 1:
             continue
 
-        if not is_inside_day(df, last_idx):
-            continue
-
+        # Must have yesterday too
         today = df.iloc[last_idx]
         yesterday = df.iloc[last_idx - 1]
 
+        # inside check (with tolerance)
+        inside_ok, inside_tightness = inside_with_tolerance(df, last_idx, INSIDE_TOL_ATR)
+        if not inside_ok:
+            inside_fail += 1
+            continue
+        inside_pass += 1
+
         atr10_val = df["ATR10"].iloc[last_idx]
-        if np.isnan(atr10_val) or atr10_val == 0:
+        if pd.isna(atr10_val) or float(atr10_val) <= 0:
             continue
 
         today_range = float(today["High"] - today["Low"])
-        if today_range > RANGE_COMPRESSION_PCT * float(atr10_val):
-            continue
+        compression_ratio = today_range / float(atr10_val)  # smaller is tighter
+        compression_score = max(0.0, 1.0 - compression_ratio)  # keep for ranking only
 
-        # Dollar volume filter (helps follow-through)
+        # ---- SMART $VOLUME FILTER (exclude today's partial bar when market is open) ----
         try:
-            dv = (df["Close"].iloc[-DOLLAR_VOL_LOOKBACK:] * df["Volume"].iloc[-DOLLAR_VOL_LOOKBACK:]).dropna()
+            now_et = pd.Timestamp.now(tz=US_MARKET_TZ)
+            today_date = now_et.date()
+            last_date = df.index[-1].date()
+
+            market_still_open = now_et.time() < _market_close_time_et()  # 4:00pm ET
+            exclude_last = (last_date == today_date) and market_still_open
+
+            if exclude_last:
+                close_slice = df["Close"].iloc[-(DOLLAR_VOL_LOOKBACK + 1):-1]
+                vol_slice = df["Volume"].iloc[-(DOLLAR_VOL_LOOKBACK + 1):-1]
+            else:
+                close_slice = df["Close"].iloc[-DOLLAR_VOL_LOOKBACK:]
+                vol_slice = df["Volume"].iloc[-DOLLAR_VOL_LOOKBACK:]
+
+            dv = (close_slice * vol_slice).dropna()
             avg_dv = float(dv.mean()) if not dv.empty else 0.0
         except Exception:
             avg_dv = 0.0
-        if avg_dv < MIN_DOLLAR_VOL and t not in MAJOR_ETFS:
-            continue
 
+        if avg_dv < MIN_DOLLAR_VOL and t not in MAJOR_ETFS:
+            killed_by_dv += 1
+            continue
+        # ---------------------------------------------------------------------
+
+        # trend features (rank + direction)
         above_ema = bool(today["Close"] > df["EMA21"].iloc[last_idx]) if USE_TREND_FILTER else True
 
-        # EMA21 slope over ~5 sessions, normalized by ATR
         ema21_series = df["EMA21"]
         if len(ema21_series) > 5:
             ema21_slope_raw = float(ema21_series.iloc[last_idx] - ema21_series.iloc[last_idx - 5])
         else:
             ema21_slope_raw = float(ema21_series.iloc[last_idx] - ema21_series.iloc[0])
 
-        try:
-            ema21_slope_norm = float(ema21_slope_raw) / float(atr10_val)
-        except Exception:
-            ema21_slope_norm = 0.0
+        ema21_slope_norm = float(ema21_slope_raw) / float(atr10_val)
 
-        compression_ratio = today_range / float(atr10_val)
-        compression_score = max(0.0, 1.0 - compression_ratio)
-
-        # Market regime penalty (context only)
+        # SPY regime (small nudge)
         market_ok = True
+        spy_bias = 0.0
         if spy_ctx is not None:
-            # require SPY above EMA21 for "friendly" regime; otherwise penalize score
-            if not spy_ctx["above_ema21"]:
-                market_ok = False
+            market_ok = bool(spy_ctx["above_ema21"])
+            spy_bias = 1.0 if market_ok else -1.0
 
-        all_inside_days.append(
+        candidates.append(
             {
                 "ticker": t,
                 "date": df.index[last_idx].date().isoformat(),
@@ -452,39 +496,31 @@ def scan_inside_days():
                 "atr10": round(float(atr10_val), 4),
                 "today_range": round(float(today_range), 4),
                 "compression_score": round(float(compression_score), 4),
+                "inside_tightness": round(float(inside_tightness), 4),
                 "above_ema": above_ema,
                 "market_ok": market_ok,
-                "ema21_slope": round(float(ema21_slope_raw), 6),
                 "ema21_slope_norm": round(float(ema21_slope_norm), 4),
                 "ema21_slope_norm_raw": float(ema21_slope_norm),
                 "avg_dollar_vol": round(float(avg_dv), 0),
+                "spy_bias": spy_bias,
             }
         )
 
-    print(f"Found {len(all_inside_days)} inside-day candidates.")
+    print(f"Found {len(candidates)} inside-day candidates.")
+    print(f"diagnostics: inside_pass={inside_pass} inside_fail={inside_fail} killed_by_dv={killed_by_dv}")
 
-    # ---- SCORE + DIRECTION (best hybrid: stock-first + SPY tiebreaker) ----
-    filtered = []
-    spy_bias = 0.0
-    if spy_ctx is not None:
-        spy_bias = 1.0 if spy_ctx["above_ema21"] else -1.0
-
-    for sig in all_inside_days:
-        base = WEIGHT_COMPRESSION * float(sig["compression_score"])
-        if sig["above_ema"]:
-            base += WEIGHT_TREND * 1.0
-        if not sig["market_ok"]:
-            base *= 0.70  # regime penalty only
-
+    # ---- SCORE + DIRECTION (rank first, then options spread) ----
+    scored = []
+    for sig in candidates:
+        # direction logic
         stock_bias = 1.0 if sig["above_ema"] else -1.0
-        slope = float(sig.get("ema21_slope_norm_raw", sig["ema21_slope_norm"]))
+        slope = float(sig["ema21_slope_norm_raw"])
         slope_bias = _clamp(slope, -1.0, 1.0)
-
         combined = 0.6 * stock_bias + 0.4 * slope_bias
 
         # SPY tiebreaker only when stock trend isn't strong
         if spy_ctx is not None and abs(slope) < STRONG_SLOPE:
-            combined = (1.0 - SPY_DIR_WEIGHT) * combined + SPY_DIR_WEIGHT * spy_bias
+            combined = (1.0 - SPY_DIR_WEIGHT) * combined + SPY_DIR_WEIGHT * float(sig["spy_bias"])
 
         direction = "CALL" if combined >= 0 else "PUT"
 
@@ -494,73 +530,64 @@ def scan_inside_days():
         if direction == "PUT" and slope > SLOPE_TOL:
             continue
 
-        sig["direction"] = direction
-        sig["score"] = round(float(base), 4)
-        filtered.append(sig)
+        # rank score
+        trend_score = 1.0 if sig["above_ema"] else 0.0
+        slope_score = (slope_bias + 1.0) / 2.0  # map [-1..1] to [0..1]
 
-    all_inside_days = filtered
-    by_ticker = {sig["ticker"]: sig for sig in all_inside_days}
+        spy_score = 1.0 if sig["market_ok"] else 0.0
 
-    # ---- CHECK SPREADS AND BUILD TIER A ----
+        base = (
+            WEIGHT_INSIDE_TIGHTNESS * float(sig["inside_tightness"])
+            + WEIGHT_TREND * (0.5 * trend_score + 0.5 * slope_score)
+            + WEIGHT_SPY_REGIME * spy_score
+            + 0.10 * float(sig["compression_score"])  # small extra bias; not a gate
+        )
+
+        sig2 = sig.copy()
+        sig2["direction"] = direction
+        sig2["score"] = round(float(base), 4)
+        scored.append(sig2)
+
+    scored = sorted(scored, key=lambda x: x["score"], reverse=True)
+
+    # ---- OPTIONS SPREAD CHECK ----
     tight = []
-    all_sorted = sorted(all_inside_days, key=lambda x: x["score"], reverse=True)
-
-    for i, sig in enumerate(all_sorted):
-        if i >= CHECK_OPTIONS_FOR_MAX:
-            break
-        best_spread = best_option_spread_for_ticker(sig["ticker"], sig["close"])
+    for i, sig in enumerate(scored[:CHECK_OPTIONS_FOR_MAX]):
+        best_spread = best_option_spread_for_ticker(sig["ticker"], float(sig["close"]))
         if best_spread is None:
             continue
 
-        base_sig = by_ticker[sig["ticker"]].copy()
-        base_sig["best_spread"] = round(float(best_spread), 4)
-        base_sig["score"] = round(float(base_sig["score"] + WEIGHT_SPREAD), 4)
-        tight.append(base_sig)
+        sig2 = sig.copy()
+        sig2["best_spread"] = round(float(best_spread), 4)
+
+        # bonus if tight spread
+        sig2["score"] = round(float(sig2["score"] + WEIGHT_SPREAD_BONUS), 4)
+        tight.append(sig2)
 
     tight = sorted(tight, key=lambda x: x["score"], reverse=True)
-
-    # ---- OPTIONAL: SECTOR CAP FOR CORRELATION CONTROL ----
-    if ENABLE_SECTOR_CAP and tight:
-        # lookup sectors for only top N to avoid slowing everything down
-        topN = tight[:SECTOR_LOOKUP_MAX]
-        for r in topN:
-            r["sector"] = get_sector_fast(r["ticker"])
-        for r in tight[SECTOR_LOOKUP_MAX:]:
-            r["sector"] = "Unknown"
-
-        capped = []
-        counts = {}
-        for r in tight:
-            sec = r.get("sector", "Unknown")
-            counts.setdefault(sec, 0)
-            if counts[sec] >= MAX_PER_SECTOR:
-                continue
-            counts[sec] += 1
-            capped.append(r)
-        tight = capped
-
-    all_inside_days = sorted(all_inside_days, key=lambda x: x["score"], reverse=True)
-    return all_inside_days, tight, spy_ctx
+    return scored, tight, spy_ctx
 
 if __name__ == "__main__":
     all_setups, tight_setups, spy_ctx = scan_inside_days()
 
-    tier_a = [r for r in tight_setups if r["score"] >= 0.55]
+    # Tier A cutoff
+    TIER_A_SCORE = 0.55
+    tier_a = [r for r in tight_setups if r["score"] >= TIER_A_SCORE]
 
     if spy_ctx is not None:
         print(f"\nSPY context: close={spy_ctx['close']:.2f} above_ema21={spy_ctx['above_ema21']}")
 
     if tier_a:
-        print("\nTIER A (score >= 0.55): inside-day setups WITH tight options (best hybrid)")
-        cols = "ticker | score | dir  | date       | close   | ATR10 | spread | slope_norm | $vol(M) | sector"
+        print("\nTIER A (score >= 0.55): inside-day setups WITH tight options (late-day / next-morning)")
+        cols = "ticker | score | dir  | date       | close   | ATR10 | spread | inside_tight | comp | slope_norm | $vol(M)"
         print(cols)
         for r in tier_a:
             dollar_vol_m = (float(r.get("avg_dollar_vol", 0.0)) / 1_000_000.0)
-            sector = r.get("sector", "NA")
             print(
                 f"{r['ticker']:5s} | {r['score']:>5} | {r['direction']:<4} | {r['date']} | "
                 f"{r['close']:>7} | {r['atr10']:>5} | {r.get('best_spread','NA'):>6} | "
-                f"{r.get('ema21_slope_norm','NA'):>9} | {dollar_vol_m:>6.1f} | {sector}"
+                f"{r.get('inside_tightness','NA'):>11} | {r.get('compression_score','NA'):>4} | "
+                f"{r.get('ema21_slope_norm','NA'):>9} | {dollar_vol_m:>6.1f}"
             )
     else:
         print("\nTIER A (score >= 0.55): none")
