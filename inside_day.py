@@ -347,13 +347,34 @@ def scan_inside_days():
     ohlc_map = download_daily_spx(spx)
     print(f"Downloaded OK for {len(ohlc_map)} tickers.")
 
+    # ---------------- DIAGNOSTIC COUNTERS ----------------
+    diag = {
+        "tickers_total": 0,
+        "len_ge_12": 0,
+        "after_intraday_override": 0,
+        "atr_ok": 0,
+        "inside_ok": 0,
+        "compression_ok": 0,
+        "passed_all": 0,
+        # extra: why "not inside"
+        "not_inside_broke_high": 0,
+        "not_inside_broke_low": 0,
+        "not_inside_other": 0,
+        # extra: compression fails
+        "compression_failed": 0,
+    }
+
     all_inside_days = []
 
     for t, df in ohlc_map.items():
+        diag["tickers_total"] += 1
+
         if len(df) < 12:
             continue
+        diag["len_ge_12"] += 1
 
         df = override_today_with_intraday(t, df)
+        diag["after_intraday_override"] += 1
 
         df["ATR10"] = atr(df, 10)
         df["EMA21"] = ema(df["Close"], 21)
@@ -362,18 +383,41 @@ def scan_inside_days():
         if last_idx < 1:
             continue
 
-        if not is_inside_day(df, last_idx):
+        # ---- ATR sanity ----
+        atr10_val = df["ATR10"].iloc[last_idx]
+        if np.isnan(atr10_val) or atr10_val == 0:
             continue
+        diag["atr_ok"] += 1
+
+        # ---- Inside-day diagnostic ----
+        # classify why it failed (high break vs low break) so you can see what's happening
+        today_hi = float(df["High"].iloc[last_idx])
+        today_lo = float(df["Low"].iloc[last_idx])
+        y_hi = float(df["High"].iloc[last_idx - 1])
+        y_lo = float(df["Low"].iloc[last_idx - 1])
+
+        if not (today_hi <= y_hi and today_lo >= y_lo):
+            if today_hi > y_hi:
+                diag["not_inside_broke_high"] += 1
+            elif today_lo < y_lo:
+                diag["not_inside_broke_low"] += 1
+            else:
+                diag["not_inside_other"] += 1
+            continue
+        diag["inside_ok"] += 1
 
         today = df.iloc[last_idx]
         yesterday = df.iloc[last_idx - 1]
 
-        today_range = today["High"] - today["Low"]
-        atr10_val = df["ATR10"].iloc[last_idx]
-        if np.isnan(atr10_val) or atr10_val == 0:
+        today_range = today_hi - today_lo
+
+        # ---- Compression filter diagnostic ----
+        if today_range > RANGE_COMPRESSION_PCT * float(atr10_val):
+            diag["compression_failed"] += 1
             continue
-        if today_range > RANGE_COMPRESSION_PCT * atr10_val:
-            continue
+        diag["compression_ok"] += 1
+
+        diag["passed_all"] += 1
 
         above_ema = bool(today["Close"] > df["EMA21"].iloc[last_idx]) if USE_TREND_FILTER else True
 
@@ -390,10 +434,10 @@ def scan_inside_days():
         except Exception:
             ema21_slope_norm = 0.0
 
-        compression_ratio = today_range / atr10_val
+        compression_ratio = today_range / float(atr10_val)
         compression_score = max(0.0, 1.0 - compression_ratio)
 
-        # ---- NEW: open expansion potential (tiebreaker metric) ----
+        # ---- open expansion potential (tiebreaker metric) ----
         open_expansion_score = abs(float(ema21_slope_norm)) * float(compression_score)
 
         # SPY as FILTER ONLY (Option A): bearish SPY penalizes score, does not drive direction
@@ -419,6 +463,21 @@ def scan_inside_days():
                 "open_expansion_score": round(float(open_expansion_score), 4),
             }
         )
+
+    # Print diagnostics BEFORE the summary so you see why you got 0
+    print("DIAGNOSTICS:")
+    print(
+        f"  tickers_total={diag['tickers_total']} | len>=12={diag['len_ge_12']} | "
+        f"atr_ok={diag['atr_ok']} | inside_ok={diag['inside_ok']} | "
+        f"compression_ok={diag['compression_ok']} | passed_all={diag['passed_all']}"
+    )
+    print(
+        f"  not_inside: broke_high={diag['not_inside_broke_high']} | "
+        f"broke_low={diag['not_inside_broke_low']} | other={diag['not_inside_other']}"
+    )
+    print(
+        f"  compression_failed={diag['compression_failed']} (threshold={RANGE_COMPRESSION_PCT} * ATR10)"
+    )
 
     print(f"Found {len(all_inside_days)} inside-day candidates.")
 
