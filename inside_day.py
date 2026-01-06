@@ -12,7 +12,9 @@ from curl_cffi import requests as crequests  # Option B: required by your yfinan
 
 # ---------------- CONFIG ----------------
 LOOKBACK_DAYS = 30
-RANGE_COMPRESSION_PCT = 8.0
+RANGE_COMPRESSION_PCT = 0.8  # run wider net, then tag which would pass 0.7
+CORE_COMPRESSION_PCT = 0.7   # "core07" tag threshold
+
 USE_TREND_FILTER = True
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 US_MARKET_TZ = "US/Eastern"
@@ -27,6 +29,9 @@ ATM_MONEYNES_PCT = 0.02            # scan strikes within ±2% of stock price
 WEIGHT_COMPRESSION = 0.5
 WEIGHT_TREND = 0.3
 WEIGHT_SPREAD = 0.2
+
+# NEW: reward stronger (cleaner) trends by slope magnitude (0..1)
+WEIGHT_SLOPE_STRENGTH = 0.12
 
 # Major ETFs explicitly included in the scan
 MAJOR_ETFS = ["SPY", "QQQ", "IWM", "DIA"]
@@ -268,7 +273,7 @@ def override_today_with_intraday(ticker: str, df_daily: pd.DataFrame) -> pd.Data
 
     return df_daily
 
-# -------------- OPTION SPREAD CHECK --------------
+# -------------- OPTION SPREAD CHECK (unchanged) --------------
 def best_option_spread_for_ticker(ticker: str, spot: float):
     try:
         tk = yf.Ticker(ticker)
@@ -347,7 +352,6 @@ def scan_inside_days():
     ohlc_map = download_daily_spx(spx)
     print(f"Downloaded OK for {len(ohlc_map)} tickers.")
 
-    # ---------------- DIAGNOSTIC COUNTERS ----------------
     diag = {
         "tickers_total": 0,
         "len_ge_12": 0,
@@ -356,11 +360,9 @@ def scan_inside_days():
         "inside_ok": 0,
         "compression_ok": 0,
         "passed_all": 0,
-        # extra: why "not inside"
         "not_inside_broke_high": 0,
         "not_inside_broke_low": 0,
         "not_inside_other": 0,
-        # extra: compression fails
         "compression_failed": 0,
     }
 
@@ -383,14 +385,11 @@ def scan_inside_days():
         if last_idx < 1:
             continue
 
-        # ---- ATR sanity ----
         atr10_val = df["ATR10"].iloc[last_idx]
         if np.isnan(atr10_val) or atr10_val == 0:
             continue
         diag["atr_ok"] += 1
 
-        # ---- Inside-day diagnostic ----
-        # classify why it failed (high break vs low break) so you can see what's happening
         today_hi = float(df["High"].iloc[last_idx])
         today_lo = float(df["Low"].iloc[last_idx])
         y_hi = float(df["High"].iloc[last_idx - 1])
@@ -411,24 +410,20 @@ def scan_inside_days():
 
         today_range = today_hi - today_lo
 
-        # ---- Compression filter diagnostic ----
         if today_range > RANGE_COMPRESSION_PCT * float(atr10_val):
             diag["compression_failed"] += 1
             continue
         diag["compression_ok"] += 1
-
         diag["passed_all"] += 1
 
         above_ema = bool(today["Close"] > df["EMA21"].iloc[last_idx]) if USE_TREND_FILTER else True
 
-        # --- EMA21 slope (raw) ---
         ema21_series = df["EMA21"]
         if len(ema21_series) > 5:
             ema21_slope_raw = float(ema21_series.iloc[last_idx] - ema21_series.iloc[last_idx - 5])
         else:
             ema21_slope_raw = float(ema21_series.iloc[last_idx] - ema21_series.iloc[0])
 
-        # --- normalize slope by ATR ---
         try:
             ema21_slope_norm = float(ema21_slope_raw) / float(atr10_val)
         except Exception:
@@ -436,11 +431,10 @@ def scan_inside_days():
 
         compression_ratio = today_range / float(atr10_val)
         compression_score = max(0.0, 1.0 - compression_ratio)
+        core_07 = bool(compression_ratio <= CORE_COMPRESSION_PCT)
 
-        # ---- open expansion potential (tiebreaker metric) ----
         open_expansion_score = abs(float(ema21_slope_norm)) * float(compression_score)
 
-        # SPY as FILTER ONLY (Option A): bearish SPY penalizes score, does not drive direction
         market_ok = True
         if spy_ctx is not None and not spy_ctx["above_ema21"]:
             market_ok = False
@@ -456,6 +450,8 @@ def scan_inside_days():
                 "atr10": round(float(atr10_val), 4),
                 "above_ema": above_ema,
                 "compression_score": round(float(compression_score), 4),
+                "compression_ratio": round(float(compression_ratio), 4),
+                "core_07": core_07,
                 "market_ok": market_ok,
                 "ema21_slope": round(float(ema21_slope_raw), 6),
                 "ema21_slope_norm": round(float(ema21_slope_norm), 4),
@@ -464,7 +460,6 @@ def scan_inside_days():
             }
         )
 
-    # Print diagnostics BEFORE the summary so you see why you got 0
     print("DIAGNOSTICS:")
     print(
         f"  tickers_total={diag['tickers_total']} | len>=12={diag['len_ge_12']} | "
@@ -487,18 +482,19 @@ def scan_inside_days():
         base = WEIGHT_COMPRESSION * sig["compression_score"]
         if sig["above_ema"]:
             base += WEIGHT_TREND * 1.0
+
+        # NEW: slope strength reward (magnitude of normalized EMA slope)
+        slope = float(sig.get("ema21_slope_norm_raw", sig["ema21_slope_norm"]))
+        slope_bias = _clamp(slope, -1.0, 1.0)
+        base += WEIGHT_SLOPE_STRENGTH * abs(slope_bias)
+
         if not sig["market_ok"]:
             base *= 0.7  # SPY filter penalty (Option A)
 
-        # Direction = stock only (SPY is NOT used here)
         stock_bias = 1.0 if sig["above_ema"] else -1.0
-        slope = float(sig.get("ema21_slope_norm_raw", sig["ema21_slope_norm"]))
-        slope_bias = _clamp(slope, -1.0, 1.0)
-
         combined = 0.6 * stock_bias + 0.4 * slope_bias
         direction = "CALL" if combined >= 0 else "PUT"
 
-        # --- HARD GATE: slope must not contradict direction (with tolerance) ---
         if direction == "CALL" and slope < -SLOPE_TOL:
             continue
         if direction == "PUT" and slope > SLOPE_TOL:
@@ -511,10 +507,8 @@ def scan_inside_days():
     all_inside_days = filtered
     by_ticker = {sig["ticker"]: sig for sig in all_inside_days}
 
-    # ---- CHECK SPREADS AND BUILD TIER A ----
     tight_spread_inside_days = []
 
-    # check highest scores first; open_expansion_score breaks ties
     all_inside_days_sorted_for_check = sorted(
         all_inside_days,
         key=lambda x: (x["score"], x.get("open_expansion_score", 0.0)),
@@ -543,15 +537,19 @@ def scan_inside_days():
 if __name__ == "__main__":
     all_setups, tight_setups = scan_inside_days()
 
-    # --- TIER A: only show score >= 0.55 ---
     tier_a_filtered = [r for r in tight_setups if r["score"] >= 0.55]
 
     if tier_a_filtered:
         print("\nTIER A (score >= 0.55): inside-day setups WITH tight options")
-        print("ticker | score | dir   | date       | prev_high | prev_low | close   | ATR10 | best_spread | ema21_slope | slope_norm | openX")
+        print(
+            "ticker | score | dir   | core07 | ratio  | date       | prev_high | prev_low | close   | "
+            "ATR10 | best_spread | ema21_slope | slope_norm | openX"
+        )
         for r in tier_a_filtered:
+            core_flag = "Y" if r.get("core_07") else "N"
             print(
-                f"{r['ticker']:5s} | {r['score']:>5} | {r['direction']:<5} | {r['date']} | "
+                f"{r['ticker']:5s} | {r['score']:>5} | {r['direction']:<5} | {core_flag:>5} | "
+                f"{r.get('compression_ratio','NA'):>5} | {r['date']} | "
                 f"{r['prev_high']:>8} | {r['prev_low']:>8} | "
                 f"{r['close']:>7} | {r['atr10']:>5} | {r.get('best_spread', 'NA'):>11} | "
                 f"{r['ema21_slope']:>10} | {r.get('ema21_slope_norm','NA'):>9} | {r.get('open_expansion_score','NA'):>5}"
