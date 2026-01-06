@@ -12,7 +12,7 @@ from curl_cffi import requests as crequests  # Option B: required by your yfinan
 
 # ---------------- CONFIG ----------------
 LOOKBACK_DAYS = 30
-RANGE_COMPRESSION_PCT = 0.7
+RANGE_COMPRESSION_PCT = 8.0
 USE_TREND_FILTER = True
 WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 US_MARKET_TZ = "US/Eastern"
