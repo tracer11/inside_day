@@ -27,10 +27,12 @@ ATM_MONEYNES_PCT = 0.02            # scan strikes within ±2% of stock price
 
 # scoring weights (SETUP-ONLY)
 WEIGHT_COMPRESSION = 0.5
-WEIGHT_TREND = 0.3
+WEIGHT_TREND = 0.3                 # NOW SCALED by distance from EMA (normalized by ATR)
+WEIGHT_SLOPE_STRENGTH = 0.12       # reward stronger trend slope magnitude (0..1)
 
-# NEW: reward stronger (cleaner) trends by slope magnitude (0..1)
-WEIGHT_SLOPE_STRENGTH = 0.12
+# Trend distance scaling cap (in ATR units)
+# Example: 1.0 means ">= 1 ATR away from EMA gets full trend credit"
+TREND_DIST_CAP_ATR = 1.0
 
 # Major ETFs explicitly included in the scan
 MAJOR_ETFS = ["SPY", "QQQ", "IWM", "DIA"]
@@ -42,7 +44,7 @@ SLOPE_TOL = 0.02
 # 1) SPY slope regime gating (BULL/BEAR/NEUTRAL)
 SPY_EMA_LEN = 21
 SPY_SLOPE_LOOKBACK = 5
-SPY_SLOPE_EPS = 0.00015   # normalized slope threshold (~0.015% over lookback). tune 0.0001-0.0003
+SPY_SLOPE_EPS = 0.00015   # normalized slope threshold. tune 0.0001-0.0003
 
 # 1b) ticker EMA alignment gating
 REQUIRE_TICKER_ALIGN = True
@@ -64,7 +66,6 @@ UA = {
 
 # -------------- UTILS --------------
 def _to_float(x):
-    # handles scalar, numpy scalar, or single-element Series
     if hasattr(x, "iloc"):
         return float(x.iloc[0])
     return float(x)
@@ -75,6 +76,9 @@ def _normalize_ticker(t: str) -> str:
 def _clamp(x: float, lo: float = -1.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, float(x)))
 
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
 def _safe_float(x, default=np.nan) -> float:
     try:
         v = float(x)
@@ -84,7 +88,6 @@ def _safe_float(x, default=np.nan) -> float:
 
 # -------------- S&P 500 LIST (robust) --------------
 def get_sp500_tickers(max_retries: int = 3) -> list[str]:
-    # FIX: old datahub URL sometimes 404s; use stable GitHub raw CSV
     DATAHUB_CSV = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
     last_err = None
 
@@ -98,20 +101,14 @@ def get_sp500_tickers(max_retries: int = 3) -> list[str]:
             candidates = []
             for df in tables:
                 cols = {str(c).lower().strip() for c in df.columns}
-                if ("symbol" in cols or "ticker symbol" in cols) and (
-                    "security" in cols or "company" in cols
-                ):
+                if ("symbol" in cols or "ticker symbol" in cols) and ("security" in cols or "company" in cols):
                     candidates.append(df)
 
             if not candidates:
                 raise ValueError("No constituents-like table found on Wikipedia.")
 
             df = max(candidates, key=len)
-            sym_col = (
-                "Symbol"
-                if "Symbol" in df.columns
-                else ("Ticker symbol" if "Ticker symbol" in df.columns else None)
-            )
+            sym_col = "Symbol" if "Symbol" in df.columns else ("Ticker symbol" if "Ticker symbol" in df.columns else None)
             if not sym_col:
                 raise ValueError("Ticker column missing in chosen table.")
 
@@ -136,9 +133,7 @@ def get_sp500_tickers(max_retries: int = 3) -> list[str]:
             raise ValueError(f"Too few tickers from fallback: {len(tickers)}")
         return tickers
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to fetch S&P 500 tickers. Wiki error: {last_err}; Fallback error: {e}"
-        )
+        raise RuntimeError(f"Failed to fetch S&P 500 tickers. Wiki error: {last_err}; Fallback error: {e}")
 
 # -------------- TECHNICALS --------------
 def atr(df: pd.DataFrame, period: int = 10) -> pd.Series:
@@ -147,10 +142,7 @@ def atr(df: pd.DataFrame, period: int = 10) -> pd.Series:
     close = df["Close"]
     prev_close = close.shift(1)
 
-    parts = pd.concat(
-        [high - low, (high - prev_close).abs(), (low - prev_close).abs()],
-        axis=1,
-    )
+    parts = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1)
     tr = parts.max(axis=1, skipna=True)
     return tr.rolling(period).mean()
 
@@ -158,10 +150,6 @@ def ema(series: pd.Series, length: int = 21) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 def normalized_ema_slope(close_like, length: int = 21, lookback: int = 5) -> float:
-    """
-    Normalized EMA slope: (ema[t] - ema[t-lookback]) / ema[t]
-    Hardened against yfinance returning DataFrames / MultiIndex.
-    """
     if isinstance(close_like, pd.DataFrame):
         close = close_like.iloc[:, 0]
     else:
@@ -194,12 +182,6 @@ def avg_dollar_vol_20(df: pd.DataFrame) -> float:
         return np.nan
     dv = (df["Close"] * df["Volume"]).rolling(20).mean()
     return _safe_float(dv.iloc[-1], np.nan)
-
-def is_inside_day(df: pd.DataFrame, idx: int) -> bool:
-    return (
-        df["High"].iloc[idx] <= df["High"].iloc[idx - 1]
-        and df["Low"].iloc[idx] >= df["Low"].iloc[idx - 1]
-    )
 
 # -------------- DAILY DOWNLOAD (batch + curl_cffi session) --------------
 def _split_chunks(lst, n):
@@ -359,7 +341,7 @@ def best_option_spread_for_ticker(ticker: str, spot: float):
                 continue
             if pd.isna(bid) or pd.isna(ask):
                 continue
-            if float(bid) <= 0:  # avoid garbage rows
+            if float(bid) <= 0:
                 continue
             if spot == 0:
                 continue
@@ -373,10 +355,9 @@ def best_option_spread_for_ticker(ticker: str, spot: float):
             if best_spread is None or spread < best_spread:
                 best_spread = spread
 
-    # Try first 2 expirations (nearest sometimes has garbage quotes in yfinance)
-    for exp in expirations[:2]:
+    for exp in (yf.Ticker(ticker).options or [])[:2]:
         try:
-            chain = tk.option_chain(exp)
+            chain = yf.Ticker(ticker).option_chain(exp)
         except Exception:
             continue
         scan_df(chain.calls if hasattr(chain, "calls") else None)
@@ -385,10 +366,6 @@ def best_option_spread_for_ticker(ticker: str, spot: float):
     return best_spread
 
 def spread_ok(best_spread: float | None, est_mid: float | None = None) -> bool:
-    """
-    We don't have the actual mid for the chosen contract (we only tracked best spread),
-    so abs spread is the reliable check here.
-    """
     if best_spread is None:
         return False
     return float(best_spread) <= float(MAX_ABS_SPREAD)
@@ -461,14 +438,12 @@ def scan_inside_days():
         "compression_ok": 0,
         "passed_all": 0,
 
-        # upgrades diagnostics
         "dvol_failed": 0,
         "atrpct_failed": 0,
         "dist_failed": 0,
         "spy_gate_failed": 0,
         "ticker_align_failed": 0,
 
-        # spread diagnostics (SOFT informational)
         "options_checked": 0,
         "spread_ok": 0,
         "spread_none": 0,
@@ -528,7 +503,6 @@ def scan_inside_days():
             continue
         diag["compression_ok"] += 1
 
-        # ---------------- UPGRADE #2: dollar-volume + ATR% floor ----------------
         dvol20 = avg_dollar_vol_20(df)
         if (not np.isfinite(dvol20)) or dvol20 < MIN_DOLLAR_VOL_20:
             diag["dvol_failed"] += 1
@@ -540,7 +514,6 @@ def scan_inside_days():
             diag["atrpct_failed"] += 1
             continue
 
-        # ---------------- UPGRADE #3: distance-to-range (not extended) ----------------
         prev_high = float(yesterday["High"])
         prev_low = float(yesterday["Low"])
         mid = (prev_high + prev_low) / 2.0
@@ -549,7 +522,6 @@ def scan_inside_days():
             diag["dist_failed"] += 1
             continue
 
-        # ---------------- UPGRADE #1: SPY regime gating + ticker alignment ----------------
         ema21_series = df["EMA21"]
         if len(ema21_series) > 5:
             ema21_slope_raw = float(ema21_series.iloc[last_idx] - ema21_series.iloc[last_idx - 5])
@@ -561,7 +533,8 @@ def scan_inside_days():
         except Exception:
             ema21_slope_norm = 0.0
 
-        above_ema = bool(close_val > df["EMA21"].iloc[last_idx]) if USE_TREND_FILTER else True
+        ema21_val = float(df["EMA21"].iloc[last_idx])
+        above_ema = bool(close_val > ema21_val) if USE_TREND_FILTER else True
 
         ticker_bias = "NEUTRAL"
         if above_ema and ema21_slope_norm > 0:
@@ -584,10 +557,9 @@ def scan_inside_days():
                 diag["spy_gate_failed"] += 1
                 continue
 
-        if REQUIRE_TICKER_ALIGN:
-            if ticker_bias == "NEUTRAL":
-                diag["ticker_align_failed"] += 1
-                continue
+        if REQUIRE_TICKER_ALIGN and ticker_bias == "NEUTRAL":
+            diag["ticker_align_failed"] += 1
+            continue
 
         diag["passed_all"] += 1
 
@@ -597,6 +569,10 @@ def scan_inside_days():
 
         open_expansion_score = abs(float(ema21_slope_norm)) * float(compression_score)
 
+        # NEW: distance-from-EMA in ATR units (used for trend scaling in score)
+        trend_dist_atr_raw = abs(close_val - ema21_val) / float(atr10_val)
+        trend_strength = _clamp01(trend_dist_atr_raw / float(TREND_DIST_CAP_ATR))
+
         all_inside_days.append(
             {
                 "ticker": t,
@@ -604,6 +580,8 @@ def scan_inside_days():
                 "prev_high": round(prev_high, 4),
                 "prev_low": round(prev_low, 4),
                 "close": round(close_val, 4),
+                "ema21": round(ema21_val, 4),
+
                 "today_range": round(float(today_range), 4),
                 "atr10": round(float(atr10_val), 4),
 
@@ -617,9 +595,14 @@ def scan_inside_days():
                 "compression_score": round(float(compression_score), 4),
                 "compression_ratio": round(float(compression_ratio), 4),
                 "core_07": core_07,
+
                 "ema21_slope": round(float(ema21_slope_raw), 6),
                 "ema21_slope_norm": round(float(ema21_slope_norm), 4),
                 "ema21_slope_norm_raw": float(ema21_slope_norm),
+
+                "trend_dist_atr": round(float(trend_dist_atr_raw), 4),
+                "trend_strength": round(float(trend_strength), 4),
+
                 "open_expansion_score": round(float(open_expansion_score), 4),
             }
         )
@@ -638,18 +621,18 @@ def scan_inside_days():
         f"  not_inside: broke_high={diag['not_inside_broke_high']} | "
         f"broke_low={diag['not_inside_broke_low']} | other={diag['not_inside_other']}"
     )
-    print(
-        f"  compression_failed={diag['compression_failed']} (threshold={RANGE_COMPRESSION_PCT} * ATR10)"
-    )
-
+    print(f"  compression_failed={diag['compression_failed']} (threshold={RANGE_COMPRESSION_PCT} * ATR10)")
     print(f"Found {len(all_inside_days)} inside-day candidates.")
 
     # ---- SCORE + DIRECTION (SETUP-ONLY) ----
     filtered = []
     for sig in all_inside_days:
         base = WEIGHT_COMPRESSION * sig["compression_score"]
-        if sig["above_ema"]:
-            base += WEIGHT_TREND * 1.0
+
+        # NEW: scaled trend credit (0..1) based on distance from EMA in ATR units
+        # rewards "clean separation" from EMA without a binary +0.3 jump
+        trend_strength = float(sig.get("trend_strength", 0.0))
+        base += WEIGHT_TREND * _clamp01(trend_strength)
 
         slope = float(sig.get("ema21_slope_norm_raw", sig["ema21_slope_norm"]))
         slope_bias = _clamp(slope, -1.0, 1.0)
@@ -661,7 +644,6 @@ def scan_inside_days():
             combined = 0.6 * stock_bias + 0.4 * slope_bias
             direction = "CALL" if combined >= 0 else "PUT"
 
-        # sanity: don't allow CALL if slope strongly down, or PUT if slope strongly up
         if direction == "CALL" and slope < -SLOPE_TOL:
             continue
         if direction == "PUT" and slope > SLOPE_TOL:
@@ -674,10 +656,9 @@ def scan_inside_days():
     all_inside_days = filtered
     by_ticker = {sig["ticker"]: sig for sig in all_inside_days}
 
-    # NOTE: Spread is SOFT informational only; score is NOT modified.
+    # Spread is SOFT informational only; score is NOT modified.
     scored_with_spread = []
 
-    # Check options spreads for top-N by SETUP score (and tiebreaker open_expansion_score)
     all_inside_days_sorted_for_check = sorted(
         all_inside_days,
         key=lambda x: (x["score"], x.get("open_expansion_score", 0.0)),
@@ -693,7 +674,6 @@ def scan_inside_days():
         if bs is None:
             diag["spread_none"] += 1
         ok = spread_ok(bs)
-
         if ok:
             diag["spread_ok"] += 1
 
@@ -701,10 +681,8 @@ def scan_inside_days():
         base_sig["best_spread"] = round(float(bs), 4) if bs is not None else None
         base_sig["spread_ok"] = bool(ok)
 
-        # IMPORTANT: do NOT change score based on spread
         scored_with_spread.append(base_sig)
 
-    # sort outputs
     all_inside_days = sorted(all_inside_days, key=lambda x: x["score"], reverse=True)
     scored_with_spread = sorted(
         scored_with_spread,
@@ -712,23 +690,19 @@ def scan_inside_days():
         reverse=True,
     )
 
-    print(
-        f"OPTIONS (soft): checked={diag['options_checked']} | spread_ok={diag['spread_ok']} | spread_none={diag['spread_none']}"
-    )
-
+    print(f"OPTIONS (soft): checked={diag['options_checked']} | spread_ok={diag['spread_ok']} | spread_none={diag['spread_none']}")
     return all_inside_days, scored_with_spread
 
 if __name__ == "__main__":
     all_setups, setups_scored_with_spread = scan_inside_days()
 
-    # Tier A based on SETUP score only; spread_ok is informational
     tier_a_filtered = [r for r in setups_scored_with_spread if r["score"] >= 0.55]
 
     if tier_a_filtered:
         print("\nTIER A (score >= 0.55): inside-day setups (spread is SOFT, score is setup-only)")
         print(
             "ticker | score | dir   | spy | core07 | ratio  | date       | prev_high | prev_low | close   | "
-            "ATR10 | atr%  | dvol20     | distATR | spread_ok | best_spread | slope_norm | openX"
+            "EMA21 | tDist | ATR10 | atr%  | dvol20     | distATR | spread_ok | best_spread | slope_norm | openX"
         )
         for r in tier_a_filtered:
             core_flag = "Y" if r.get("core_07") else "N"
@@ -739,7 +713,7 @@ if __name__ == "__main__":
                 f"{r['ticker']:5s} | {r['score']:>5} | {r['direction']:<5} | {str(r.get('spy_state','NA')):>4} | "
                 f"{core_flag:>5} | {r.get('compression_ratio','NA'):>5} | {r['date']} | "
                 f"{r['prev_high']:>8} | {r['prev_low']:>8} | "
-                f"{r['close']:>7} | {r['atr10']:>5} | "
+                f"{r['close']:>7} | {r.get('ema21','NA'):>5} | {r.get('trend_dist_atr','NA'):>5} | {r['atr10']:>5} | "
                 f"{r.get('atr_pct','NA'):>5} | {r.get('dvol20','NA'):>10} | {r.get('dist_atr','NA'):>6} | "
                 f"{sp_ok:>9} | {bs_str} | {r.get('ema21_slope_norm','NA'):>9} | {r.get('open_expansion_score','NA'):>5}"
             )
