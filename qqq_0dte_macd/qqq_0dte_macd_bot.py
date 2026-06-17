@@ -162,7 +162,10 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
             continue
         return {"idx": int(cand), "is_last": cand == len(d) - 1,
                 "direction": "long" if is_long else "short",
-                "time": d["date"].iloc[cand], "spot": float(d["close"].iloc[cand])}
+                "time": d["date"].iloc[cand], "spot": float(d["close"].iloc[cand]),
+                "cross": "up" if is_long else "dn",
+                "macd": float(d["macd"].iloc[cand]), "signal": float(d["signal"].iloc[cand]),
+                "vwap": float(vw)}
     return None
 
 
@@ -224,6 +227,11 @@ def _open_position(state: dict, opt: dict, sig: dict, fill: float, qty: int):
 
 
 def enter(ib: IB, state: dict, sig: dict, spot: float, iv: float, dry_run: bool):
+    # audit trail: why this direction was chosen (cross type + price vs VWAP)
+    logger.info(f"SIGNAL {sig['direction']} (MACD cross {sig['cross']}) @ "
+                f"{sig['time'].strftime('%H:%M')} ET | macd={sig['macd']:+.4f} "
+                f"signal={sig['signal']:+.4f} | close={sig['spot']:.2f} vwap={sig['vwap']:.2f} "
+                f"({'above' if sig['spot'] >= sig['vwap'] else 'below'} VWAP)")
     opt = select_0dte_option(ib, sig["direction"], spot, iv)
     if not opt:
         alert(f"Signal fired ({sig['direction']} @ {spot:.2f}) but no tradeable ATM 0DTE "
