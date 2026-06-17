@@ -63,6 +63,12 @@ MAX_CONTRACTS = 20        # cap (keeps paper fills realistic; raise consciously)
 MAX_SPREAD_PCT = 0.12     # skip entry if ATM 0DTE spread wider than this
 POLL_SECONDS = 20
 
+# --- connection / data-outage hardening ---
+CONNECT_RETRIES = 3       # IB connect attempts at startup
+CONNECT_BACKOFF = 10      # seconds between connect attempts
+ALERT_THROTTLE_SEC = 300  # min seconds between repeat alerts of the same IB error category
+OUTAGE_ALERT_MIN = 3      # alert if no usable bars for this many minutes during market hours
+
 ET = ZoneInfo("America/New_York")
 MARKET_OPEN_ET = dtime(9, 30)
 # Only need a few bars for the EMA recursion + shift(1). Timing is controlled by the
@@ -95,6 +101,48 @@ def now_et() -> datetime:
 def alert(msg: str, urgent: bool = False):
     logger.info(f"DISCORD: {msg}")
     ib_core.send_discord(msg, DISCORD_WEBHOOK_URL, logger, tag="QQQ-0DTE", urgent=urgent)
+
+
+# IB connectivity / data-farm error codes worth shouting about (benign "OK" and
+# informational codes like 2104/2106/2107/2158 are intentionally NOT here).
+_ALERT_CODES = {1100, 1101, 1102, 2103, 2105, 2110}
+_last_err_alert: dict[str, datetime] = {}
+
+
+def _on_ib_error(reqId, errorCode, errorString, contract=None, *extra):
+    """Turn the silent error-event stream into loud, throttled Discord alerts.
+    Catches the exact failure modes seen on 2026-06-17: the 'different IP address'
+    session conflict and the 'HMDS query returned no data' blackout that followed."""
+    msg = errorString or ""
+    if "different IP address" in msg:
+        cat = "session IP conflict"
+    elif errorCode == 162 and "no data" in msg.lower():
+        cat = "historical-data outage"
+    elif errorCode in _ALERT_CODES:
+        cat = f"connectivity (code {errorCode})"
+    else:
+        return  # benign / informational — ignore
+    now = now_et()
+    last = _last_err_alert.get(cat)
+    if last is None or (now - last).total_seconds() >= ALERT_THROTTLE_SEC:
+        _last_err_alert[cat] = now
+        alert(f"IB {cat}: {msg.strip()} (code {errorCode})", urgent=True)
+
+
+def connect_with_retry() -> IB:
+    """Connect to IB Gateway, retrying a few times before giving up loudly."""
+    import time as _time
+    last_exc = None
+    for attempt in range(1, CONNECT_RETRIES + 1):
+        try:
+            return ib_core.connect_ib(IB_PORT, IB_CLIENT_ID, logger)
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"IB connect attempt {attempt}/{CONNECT_RETRIES} failed: {e}")
+            if attempt < CONNECT_RETRIES:
+                _time.sleep(CONNECT_BACKOFF)
+    alert(f"CONNECT FAILED after {CONNECT_RETRIES} attempts: {last_exc}", urgent=True)
+    raise last_exc
 
 
 def fetch_current_iv() -> float:
@@ -346,7 +394,8 @@ def run(dry_run: bool = False):
             state["position"] = None
         ib_core.save_state(STATE_FILE, state)
 
-    ib = ib_core.connect_ib(IB_PORT, IB_CLIENT_ID, logger)
+    ib = connect_with_retry()
+    ib.errorEvent += _on_ib_error   # loud, throttled alerts on IP-conflict / data outages
     qqq = ib.qualifyContracts(Stock(SYMBOL, "SMART", "USD"))[0]
     iv = fetch_current_iv() if MANAGEMENT_MODE == "model" else 0.0
     logger.info("=" * 60)
@@ -357,6 +406,8 @@ def run(dry_run: bool = False):
                 f"cum P&L ${state.get('cumulative_pnl', 0):+.2f}")
     logger.info("=" * 60)
 
+    outage_since = None       # tracks a market-hours data blackout
+    outage_alerted = False
     try:
         while True:
             now = now_et()
@@ -376,8 +427,22 @@ def run(dry_run: bool = False):
             try:
                 df = fetch_closed_bars(ib, qqq)
                 if df is None or len(df) < MIN_BARS:
+                    # data blackout in market hours — alert only when it can actually
+                    # cost us: no trade taken yet, or a live position we're now blind to
+                    if state["position"] or not state["traded_today"]:
+                        if outage_since is None:
+                            outage_since = now
+                        elif (not outage_alerted and
+                              (now - outage_since).total_seconds() >= OUTAGE_ALERT_MIN * 60):
+                            alert(f"DATA OUTAGE: no usable {SYMBOL} bars for "
+                                  f"{OUTAGE_ALERT_MIN}+ min in market hours — a signal or "
+                                  f"exit could be missed. Check IB Gateway feed.", urgent=True)
+                            outage_alerted = True
                     ib.sleep(POLL_SECONDS)
                     continue
+                if outage_alerted:
+                    alert(f"DATA RESTORED: {SYMBOL} bars flowing again.")
+                outage_since, outage_alerted = None, False
                 spot = float(df["close"].iloc[-1])
 
                 if state["position"]:
