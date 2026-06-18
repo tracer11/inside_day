@@ -1,17 +1,18 @@
 """
 QQQ 0DTE MACD bot — PAPER-FORWARD test harness.
 
-Strategy (validated in backtest_macd_0dte.py over 2023-08..2026-06, 2.8yr):
-  - Entry: first 1-min MACD(12/26/9) crossover at/after 8:45 CST (9:45 ET) that
-    agrees with session VWAP (longs above VWAP, shorts below). One trade per day.
+Strategy (VWAP + trailing buy; see backtest_macd_real.py real-NBBO tests):
+  - Entry: first 1-min MACD(12/26/9) crossover between 8:45-9:30 CST (9:45-10:30 ET)
+    that agrees with session VWAP (longs above VWAP, shorts below). One trade per day.
   - Instrument: ATM 0DTE QQQ option (call for bull cross, put for bear).
-  - Exit (scale-out / "balanced"): stop = -50% of premium (1R). Sell HALF at +100%
-    (1:2), move stop to breakeven, run the rest to +150% (1:3). Hard flat 14:45 CST.
-  - Backtest with VWAP + scale-out: ~42% WR, expR +0.22, alive in 2026 (PF ~1.4).
+  - Exit (trailing): hard stop at -30% of premium; once up +30%, arm a trailing stop
+    and exit on a 25% give-back from the peak premium. Hard flat 14:45 CST.
+  - Real-NBBO vault test (2024-25, full session): ~+3.3%/trade, positive in BOTH years
+    (PF 1.22) — modest and NOT statistically validated (t~1.2). Paper-forward to confirm.
 
 SAFETY: hard-guarded to the PAPER port (4002). Pass --allow-live to override (don't).
-All option PnL was BS-simulated in the backtest — this paper run is to validate the
-modeled edge against REAL fills before any real capital is considered.
+The buy-side edge here is unproven (fails the formal vault gate); this paper run exists
+to build a real logged track record before any real capital is even discussed.
 
 Run (IB Gateway/TWS logged into PAPER account):
   python qqq_0dte_macd_bot.py            # live paper loop until EOD
@@ -23,6 +24,7 @@ Intended to be launched once per trading morning (~8:40 CST) by Task Scheduler.
 
 import argparse
 import logging
+import os
 import sys
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -52,13 +54,13 @@ SYMBOL = "QQQ"
 MANAGEMENT_MODE = "model"
 IV_FALLBACK = 0.20        # used if VXN fetch fails (model mode IV proxy)
 
-STOP_PCT = 0.50           # 1R = 50% of entry premium
-SCALE_AT = 2.0            # sell half at +100% (1:2)
-RUNNER_AT = 3.0           # run remainder to +150% (1:3)
+STOP_PCT = 0.30           # cut at -30% of entry premium (initial hard stop)
+ARM_PCT = 0.30            # once up +30%, arm the trailing stop
+GIVEBACK_PCT = 0.25       # then exit if premium gives back 25% from its peak
 OTM_PCT = 0.0             # 0 = ATM (the validated config). e.g. 0.004 = ~0.4% OTM
                           # (cheaper contract, better modeled expectancy but proportionally
                           # wider real spreads — paper-test before trusting). Override: --otm-pct
-RISK_PCT = 0.01           # ~1% of NLV at risk per trade (the 50% stop loss)
+RISK_PCT = 0.01           # ~1% of NLV at risk per trade (sized off the 30% stop)
 MAX_CONTRACTS = 20        # cap (keeps paper fills realistic; raise consciously)
 MAX_SPREAD_PCT = 0.12     # skip entry if ATM 0DTE spread wider than this
 POLL_SECONDS = 20
@@ -71,6 +73,7 @@ OUTAGE_ALERT_MIN = 3      # alert if no usable bars for this many minutes during
 
 ET = ZoneInfo("America/New_York")
 MARKET_OPEN_ET = dtime(9, 30)
+ENTRY_BEFORE_ET = dtime(10, 30)   # no new entries after this (edge is early-session)
 # Only need a few bars for the EMA recursion + shift(1). Timing is controlled by the
 # 9:45 ET eligibility filter in compute_signal — NOT by a bar count. A high floor here
 # would skip early-window (9:45-10:10 ET) crossovers that the backtest takes. EMA with
@@ -81,7 +84,9 @@ MIN_BARS = 5
 STATE_FILE = "qqq_0dte_state.json"
 LOG_FILE = "qqq_0dte_macd.log"
 JOURNAL_FILE = "qqq_0dte_journal.csv"
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1494853248547553300/nlPc2xVTnA-WTEMbfr0TroLJMbmgJ8VYjq_7W9J7rOqEfuHAVSnqchAIAkhIy9QkOqLr"
+# Secret kept OUT of source. Set the TRADING_DISCORD_WEBHOOK user env var (setx).
+# If unset, alerts are silently skipped (send_discord no-ops on empty url).
+DISCORD_WEBHOOK_URL = os.environ.get("TRADING_DISCORD_WEBHOOK", "")
 
 DEFAULT_STATE = {"date": None, "traded_today": False, "position": None,
                  "cumulative_pnl": 0.0, "trades_taken": 0}
@@ -200,7 +205,7 @@ def compute_signal(df: pd.DataFrame) -> dict | None:
     d["vwap"] = (tp * d["volume"]).cumsum() / d["volume"].cumsum().replace(0, np.nan)
     cross_up = (d["macd"] > d["signal"]) & (d["macd"].shift(1) <= d["signal"].shift(1))
     cross_dn = (d["macd"] < d["signal"]) & (d["macd"].shift(1) >= d["signal"].shift(1))
-    eligible = d["date"].dt.time >= ENTRY_AFTER_ET
+    eligible = (d["date"].dt.time >= ENTRY_AFTER_ET) & (d["date"].dt.time < ENTRY_BEFORE_ET)
     for cand in d.index[(cross_up | cross_dn) & eligible]:
         is_long = bool(cross_up.iloc[cand])
         px, vw = d["close"].iloc[cand], d["vwap"].iloc[cand]
@@ -266,9 +271,8 @@ def _open_position(state: dict, opt: dict, sig: dict, fill: float, qty: int):
         "entry_time": now_et().isoformat(), "direction": sig["direction"],
         "spot_at_entry": sig["spot"],
         "stop_mark": round(fill * (1 - STOP_PCT), 2),
-        "first_target": round(fill * (1 + STOP_PCT * SCALE_AT), 2),
-        "runner_target": round(fill * (1 + STOP_PCT * RUNNER_AT), 2),
-        "scaled": False, "stop_at_be": False, "realized": 0.0,
+        "arm_mark": round(fill * (1 + ARM_PCT), 2),
+        "armed": False, "peak": fill, "realized": 0.0,
     }
     state["trades_taken"] = state.get("trades_taken", 0) + 1
     ib_core.save_state(STATE_FILE, state)
@@ -290,7 +294,7 @@ def enter(ib: IB, state: dict, sig: dict, spot: float, iv: float, dry_run: bool)
 
     nlv = ib_core.get_account_balance(ib) or 0.0
     cost_ct = opt["mid"] * 100
-    # position premium sized so a 50% stop ≈ RISK_PCT of NLV
+    # position premium sized so the 30% stop ≈ RISK_PCT of NLV
     target_premium = (nlv * RISK_PCT) / STOP_PCT if nlv > 0 else cost_ct
     qty = max(1, min(MAX_CONTRACTS, int(target_premium / cost_ct))) if cost_ct > 0 else 1
 
@@ -314,7 +318,7 @@ def enter(ib: IB, state: dict, sig: dict, spot: float, iv: float, dry_run: bool)
     p = state["position"]
     alert(f"OPENED {qty}x {SYMBOL} {p['right']}{p['strike']} 0DTE @ {fill:.2f} "
           f"({sig['direction']}, spot {sig['spot']:.2f}) | stop {p['stop_mark']} "
-          f"scale {p['first_target']} runner {p['runner_target']}")
+          f"arm {p['arm_mark']} (trail {GIVEBACK_PCT:.0%} from peak)")
 
 
 def _sell(ib: IB, pos: dict, qty: int, mid_hint: float, dry_run: bool) -> float | None:
@@ -328,34 +332,38 @@ def _sell(ib: IB, pos: dict, qty: int, mid_hint: float, dry_run: bool) -> float 
 
 
 def manage(ib: IB, state: dict, spot: float, iv: float, dry_run: bool):
+    """Trailing-stop management: hard stop at -STOP_PCT until the trade is up +ARM_PCT,
+    then trail and exit on a GIVEBACK_PCT pullback from the peak premium. Hard flat at EOD."""
     pos = state["position"]
     mid = current_premium(ib, pos, spot, iv)
     if mid is None:
         return  # no quote this poll
-    cur_stop = pos["entry_price"] if pos["stop_at_be"] else pos["stop_mark"]
+    changed = False
+    if mid > pos["peak"]:
+        pos["peak"] = mid
+        changed = True
 
-    # 1) stop (worst-case checked first)
-    if mid <= cur_stop:
-        fill = _sell(ib, pos, pos["qty_open"], mid, dry_run)
-        _book_close(state, fill if fill is not None else mid, "be_stop" if pos["stop_at_be"] else "stop")
-        return
-    # 2) scale half at first target -> stop to breakeven
-    if (not pos["scaled"]) and pos["qty_open"] >= 2 and mid >= pos["first_target"]:
-        half = pos["qty_open"] // 2
-        fill = _sell(ib, pos, half, mid, dry_run)
-        if fill is not None:
-            pos["realized"] += (fill - pos["entry_price"]) * 100 * half
-            pos["qty_open"] -= half
-            pos["scaled"] = True
-            pos["stop_at_be"] = True
-            ib_core.save_state(STATE_FILE, state)
-            alert(f"SCALED {half}x {pos['symbol']} {pos['right']}{pos['strike']} @ {fill:.2f} "
-                  f"(+{STOP_PCT*SCALE_AT:.0%}); stop->breakeven, running {pos['qty_open']}x to "
-                  f"{pos['runner_target']}")
-    # 3) runner target -> close remainder
-    if mid >= pos["runner_target"]:
-        fill = _sell(ib, pos, pos["qty_open"], mid, dry_run)
-        _book_close(state, fill if fill is not None else mid, "runner")
+    if not pos["armed"]:
+        # initial hard stop, active until the trail arms
+        if mid <= pos["stop_mark"]:
+            fill = _sell(ib, pos, pos["qty_open"], mid, dry_run)
+            _book_close(state, fill if fill is not None else mid, "stop")
+            return
+        if mid >= pos["arm_mark"]:
+            pos["armed"] = True
+            changed = True
+            alert(f"ARMED trail {pos['symbol']} {pos['right']}{pos['strike']} @ {mid:.2f} "
+                  f"(+{ARM_PCT:.0%}); now trailing {GIVEBACK_PCT:.0%} below peak")
+    else:
+        # trailing stop rides up under the peak
+        trail_stop = round(pos["peak"] * (1 - GIVEBACK_PCT), 2)
+        if mid <= trail_stop:
+            fill = _sell(ib, pos, pos["qty_open"], mid, dry_run)
+            _book_close(state, fill if fill is not None else mid, "trail")
+            return
+
+    if changed:
+        ib_core.save_state(STATE_FILE, state)
 
 
 def _book_close(state: dict, fill: float, reason: str):
@@ -386,6 +394,8 @@ def close_all_eod(ib: IB, state: dict, spot: float, iv: float, dry_run: bool):
 
 # =========================================================  MAIN LOOP
 def run(dry_run: bool = False):
+    if not DISCORD_WEBHOOK_URL:
+        logger.warning("TRADING_DISCORD_WEBHOOK env var not set — Discord alerts DISABLED this run.")
     state = ib_core.load_state(STATE_FILE, DEFAULT_STATE)
     today = now_et().strftime("%Y-%m-%d")
     if state.get("date") != today:  # daily reset (keep cumulative_pnl + position if somehow open)
